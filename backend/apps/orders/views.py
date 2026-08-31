@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.utils import timezone
+from django.db import transaction
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,7 +13,7 @@ from .serializers import (
     WorkOrderSerializer, OrderMatchLogSerializer, FlightPlanSerializer,
     WorkTrackSerializer, WorkMediaSerializer, SettlementSerializer,
 )
-from .services import smart_match_and_push, gen_order_no
+from .services import (smart_match_and_push, gen_order_no, transition_order,)
 
 
 class WorkOrderViewSet(viewsets.ModelViewSet):
@@ -52,42 +53,93 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def rematch(self, request, pk=None):
         order = self.get_object()
-        logs = smart_match_and_push(order)
-        return Response(OrderMatchLogSerializer(logs, many=True).data)
 
+        if order.status not in [
+            WorkOrder.Status.PENDING,
+            WorkOrder.Status.MATCHED,
+        ]:
+            return Response(
+                {'detail': '当前订单状态不能重新匹配'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if order.pilot_id:
+            return Response(
+                {'detail': '订单已经有飞手，不能重新匹配'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        logs = smart_match_and_push(order)
+
+        return Response( OrderMatchLogSerializer(logs, many=True).data )
+    
     @action(detail=True, methods=['post'])
     def accept(self, request, pk=None):
         """飞手一键抢单。"""
-        order = self.get_object()
         if request.user.role != UserAccount.Role.PILOT:
-            return Response({'detail': '仅飞手可接单'}, status=403)
-        if order.status not in [WorkOrder.Status.PENDING, WorkOrder.Status.MATCHED]:
-            return Response({'detail': '订单状态不可接单'}, status=400)
-        if order.pilot_id:
-            return Response({'detail': '已被他人接单'}, status=400)
-        order.pilot = request.user
-        order.status = WorkOrder.Status.ACCEPTED
-        order.assigned_by_admin = False
-        order.save()
-        request.user.pilot_profile.online_status = 'busy'
-        request.user.pilot_profile.save(update_fields=['online_status'])
-        # 自动生成飞行计划草稿
-        FlightPlan.objects.get_or_create(
-            order=order,
-            defaults={
-                'plan_content': {
-                    'work_type': order.work_type,
-                    'location': order.location,
-                    'lat': float(order.lat) if order.lat else None,
-                    'lng': float(order.lng) if order.lng else None,
-                    'execute_time': order.execute_time.isoformat(),
-                    'area_or_duration': order.area_or_duration,
-                    'pilot': request.user.username,
-                    'license': request.user.pilot_profile.license_level,
-                }
-            },
-        )
-        return Response(WorkOrderSerializer(order).data)
+            return Response(
+                {'detail': '仅飞手可接单'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        with transaction.atomic():
+            order = (
+                WorkOrder.objects
+                .select_for_update()
+                .select_related('enterprise', 'pilot')
+                .get(pk=pk)
+            )
+
+            if order.status not in [
+                WorkOrder.Status.PENDING,
+                WorkOrder.Status.MATCHED,
+            ]:
+                return Response(
+                    {'detail': '订单状态不可接单'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if order.pilot_id:
+                return Response(
+                    {'detail': '已被他人接单'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            order.pilot = request.user
+            order.status = WorkOrder.Status.ACCEPTED
+            order.assigned_by_admin = False
+            order.save(
+                update_fields=[
+                    'pilot',
+                    'status',
+                    'assigned_by_admin',
+                    'updated_at',
+                ]
+            )
+
+            pilot_profile = getattr(request.user, 'pilot_profile', None)
+            if pilot_profile:
+                pilot_profile.online_status = 'busy'
+                pilot_profile.save(update_fields=['online_status'])
+
+            FlightPlan.objects.get_or_create(
+                order=order,
+                defaults={
+                    'plan_content': {
+                        'work_type': order.work_type,
+                        'location': order.location,
+                        'lat': float(order.lat) if order.lat else None,
+                        'lng': float(order.lng) if order.lng else None,
+                        'execute_time': order.execute_time.isoformat(),
+                        'area_or_duration': order.area_or_duration,
+                        'pilot': request.user.username,
+                        'license': pilot_profile.license_level
+                        if pilot_profile else '',
+                    }
+                },
+            )
+
+        return Response( WorkOrderSerializer(order, context={'request': request}).data )
 
     @action(detail=True, methods=['post'])
     def assign(self, request, pk=None):
@@ -120,9 +172,19 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='declare')
     def declare_flight(self, request, pk=None):
-        """一键提交空域飞行计划申报（对接模拟接口）。"""
         order = self.get_object()
-        plan, _ = FlightPlan.objects.get_or_create(order=order, defaults={'plan_content': {}})
+
+        if order.status != WorkOrder.Status.ACCEPTED:
+            return Response(
+                {'detail': '只有已接单订单才能申报飞行计划'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        plan, _ = FlightPlan.objects.get_or_create(
+            order=order,
+            defaults={'plan_content': {}},
+        )
+
         plan.declare_status = FlightPlan.DeclareStatus.SUBMITTED
         plan.external_ref = f'AIR-{order.order_no}'
         plan.plan_content = {
@@ -132,37 +194,72 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             'result': 'accepted',
         }
         plan.save()
+
         order.status = WorkOrder.Status.DECLARED
         order.save(update_fields=['status', 'updated_at'])
-        # 模拟批复
+
         plan.declare_status = FlightPlan.DeclareStatus.APPROVED
         plan.save(update_fields=['declare_status'])
+
         return Response(FlightPlanSerializer(plan).data)
 
     @action(detail=True, methods=['post'])
     def start_work(self, request, pk=None):
         order = self.get_object()
+
+        if order.status != WorkOrder.Status.DECLARED:
+            return Response(
+                {'detail': '只有已批复的订单才能开始作业'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if order.pilot_id != request.user.id:
+            return Response(
+                {'detail': '只有订单飞手才能开始作业'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         order.status = WorkOrder.Status.WORKING
         order.save(update_fields=['status', 'updated_at'])
+
         return Response(WorkOrderSerializer(order).data)
 
     @action(detail=True, methods=['post'])
     def upload_track(self, request, pk=None):
         order = self.get_object()
+
+        if request.user.id != order.pilot_id:
+            return Response(
+                {'detail': '只有订单飞手才能上传轨迹'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if order.status != WorkOrder.Status.WORKING:
+            return Response(
+                {'detail': '只有作业中的订单才能上传轨迹'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         points = request.data.get('points') or [request.data]
+
         created = []
+
         for p in points:
-            t = WorkTrack.objects.create(
+            track = WorkTrack.objects.create(
                 order=order,
                 lat=p['lat'],
                 lng=p['lng'],
                 altitude=p.get('altitude', 0),
             )
-            created.append(t)
+            created.append(track)
         # 简易面积：轨迹点数 * 0.05 公顷模拟
-        order.actual_area = Decimal(str(round(len(order.tracks.all()) * 0.05, 2)))
+        order.actual_area = Decimal(
+            str(round(order.tracks.count() * 0.05, 2))
+        )
+
         order.save(update_fields=['actual_area', 'updated_at'])
-        return Response(WorkTrackSerializer(created, many=True).data)
+
+        return Response( WorkTrackSerializer(created, many=True).data )
 
     @action(detail=True, methods=['post'])
     def upload_media(self, request, pk=None):
@@ -177,6 +274,19 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def submit_work(self, request, pk=None):
         order = self.get_object()
+
+        if request.user.id != order.pilot_id:
+            return Response(
+                {'detail': '只有订单飞手才能提交作业'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if order.status != WorkOrder.Status.WORKING:
+            return Response(
+                {'detail': '当前订单状态不能提交作业'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         order.status = WorkOrder.Status.SUBMITTED
         order.save(update_fields=['status', 'updated_at'])
         return Response(WorkOrderSerializer(order).data)
