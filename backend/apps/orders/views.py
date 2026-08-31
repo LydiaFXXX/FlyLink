@@ -13,7 +13,7 @@ from .serializers import (
     WorkOrderSerializer, OrderMatchLogSerializer, FlightPlanSerializer,
     WorkTrackSerializer, WorkMediaSerializer, SettlementSerializer,
 )
-from .services import (smart_match_and_push, gen_order_no, transition_order,)
+from .services import smart_match_and_push, gen_order_no
 
 
 class WorkOrderViewSet(viewsets.ModelViewSet):
